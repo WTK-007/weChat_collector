@@ -36,6 +36,7 @@ st.caption("输入任意一篇公众号文章链接，自动获取文章列表�
 for key, default in {
     "biz": None,
     "nickname": None,
+    "article_url": None,
     "articles_fetched": False,
     "crawl_running": False,
     "export_running": False,
@@ -66,6 +67,7 @@ if st.session_state.biz:
     if st.button("🔄 更换公众号"):
         st.session_state.biz = None
         st.session_state.nickname = None
+        st.session_state.article_url = None
         st.session_state.articles_fetched = False
         st.session_state.selected_articles = []
         st.session_state.select_all_state = None
@@ -103,6 +105,7 @@ else:
 
                     info = run_async(_extract_info())
                     st.session_state.biz = biz
+                    st.session_state.article_url = article_url
                     if info.get("nickname"):
                         st.session_state.nickname = info["nickname"]
                         upsert_account(biz, info["nickname"])
@@ -115,6 +118,7 @@ else:
                         biz = resolved.get("biz")
                         if biz:
                             st.session_state.biz = biz
+                            st.session_state.article_url = resolved.get("full_url") or article_url
                             if resolved.get("nickname"):
                                 st.session_state.nickname = resolved["nickname"]
                                 upsert_account(biz, resolved["nickname"])
@@ -194,6 +198,7 @@ else:
 
                 articles = await crawl_articles_via_profile(
                     ctx, biz,
+                    article_url=st.session_state.article_url,
                     max_count=crawl_max_count,
                     start_date=crawl_start_date.strftime("%Y-%m-%d") if crawl_start_date else None,
                     end_date=crawl_end_date.strftime("%Y-%m-%d") if crawl_end_date else None,

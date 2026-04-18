@@ -1,15 +1,11 @@
 """
 微信公众号文章列表爬取器（无需登录版本）
 
-通过 Playwright 模拟微信内置浏览器访问文章页面，
-从公众号历史消息页（profile_ext）获取文章列表。
-不需要登录微信公众平台后台，任何微信用户都能使用。
+通过 Playwright 模拟微信内置浏览器：
+1. 先访问一篇文章页面，建立微信 session/cookie
+2. 然后直接调用 profile_ext?action=getmsg API 分页获取文章列表
 
-流程：
-1. 用微信移动端 UA 打开一篇文章
-2. 提取公众号 biz 和名称
-3. 构造 profile_ext 页面 URL
-4. 拦截 AJAX 分页请求，解析文章列表 JSON
+不需要登录微信公众平台后台，任何人都能使用。
 """
 
 import asyncio
@@ -49,10 +45,7 @@ async def _load_cookies(context: BrowserContext) -> bool:
 
 
 async def create_wechat_context(playwright, headless: bool = True):
-    """
-    创建模拟微信内置浏览器的 Playwright 上下文。
-    使用微信移动端 UA，无需登录。
-    """
+    """创建模拟微信内置浏览器的上下文"""
     browser = await playwright.chromium.launch(
         headless=headless,
         args=["--disable-blink-features=AutomationControlled"],
@@ -60,6 +53,9 @@ async def create_wechat_context(playwright, headless: bool = True):
     context = await browser.new_context(
         user_agent=WECHAT_MOBILE_UA,
         viewport={"width": 390, "height": 844},
+        extra_http_headers={
+            "X-Requested-With": "com.tencent.mm",
+        },
     )
     await _load_cookies(context)
     return browser, context
@@ -70,12 +66,7 @@ async def create_wechat_context(playwright, headless: bool = True):
 # ──────────────────────────────────────────────
 
 async def extract_account_info(context: BrowserContext, article_url: str) -> dict:
-    """
-    访问文章页面，提取公众号 biz 和名称。
-
-    Returns:
-        {"biz": str, "nickname": str}
-    """
+    """访问文章页，提取 biz 和公众号名称"""
     page = await context.new_page()
     result = {"biz": None, "nickname": None}
 
@@ -83,36 +74,25 @@ async def extract_account_info(context: BrowserContext, article_url: str) -> dic
         await page.goto(article_url, wait_until="domcontentloaded", timeout=20000)
         await page.wait_for_timeout(2000)
 
-        # 提取 biz
-        biz = await page.evaluate("""
+        result["biz"] = await page.evaluate("""
             () => {
                 const html = document.documentElement.innerHTML;
-                // 从 JS 变量中提取
-                let match = html.match(/var\\s+biz\\s*=\\s*["']([^"']+)["']/);
-                if (match) return match[1];
-                match = html.match(/__biz[=:]\\s*["']?([A-Za-z0-9=+/]+)/);
-                if (match) return match[1];
-                // 从 URL 参数中提取
-                const url = window.location.href;
-                const m = url.match(/__biz=([A-Za-z0-9=+/]+)/);
+                let m = html.match(/var\\s+biz\\s*=\\s*["']([^"']+)["']/);
+                if (m) return m[1];
+                m = html.match(/__biz=([A-Za-z0-9=+/]+)/);
                 if (m) return m[1];
                 return null;
             }
         """)
-        result["biz"] = biz
 
-        # 提取公众号名称
-        nickname = await page.evaluate("""
+        result["nickname"] = await page.evaluate("""
             () => {
                 const el = document.getElementById('js_name')
                     || document.querySelector('.rich_media_meta_nickname .profile_nickname')
-                    || document.querySelector('a.weui-wa-hotarea')
                     || document.querySelector('#profileBt');
                 return el ? el.textContent.trim() : null;
             }
         """)
-        result["nickname"] = nickname
-
     except Exception as e:
         print(f"提取公众号信息失败: {e}")
     finally:
@@ -122,14 +102,11 @@ async def extract_account_info(context: BrowserContext, article_url: str) -> dic
 
 
 # ──────────────────────────────────────────────
-# 从 profile_ext 获取文章列表
+# 解析文章列表 JSON
 # ──────────────────────────────────────────────
 
 def _parse_article_list(general_msg_list_str: str) -> list[dict]:
-    """
-    解析 profile_ext 返回的 general_msg_list JSON 字符串。
-    处理单篇推送和多篇推送（multi_app_msg_item_list）。
-    """
+    """解析 getmsg 返回的 general_msg_list JSON"""
     articles = []
 
     try:
@@ -179,159 +156,141 @@ def _parse_article_list(general_msg_list_str: str) -> list[dict]:
     return articles
 
 
+# ──────────────────────────────────────────────
+# 采集文章列表
+# ──────────────────────────────────────────────
+
+async def _init_session(context: BrowserContext, article_url: str) -> Page:
+    """
+    先访问一篇文章页面建立微信 session cookie，
+    这是后续调用 profile_ext API 的前提。
+    """
+    page = await context.new_page()
+    await page.goto(article_url, wait_until="domcontentloaded", timeout=20000)
+    await page.wait_for_timeout(2000)
+    await _save_cookies(context)
+    return page
+
+
+async def _fetch_getmsg(
+    page: Page,
+    biz: str,
+    offset: int = 0,
+    count: int = 10,
+) -> dict:
+    """
+    直接调用 profile_ext?action=getmsg API 获取一页文章。
+
+    返回: {"articles": [...], "next_offset": int, "can_continue": bool}
+    """
+    url = (
+        f"https://mp.weixin.qq.com/mp/profile_ext?"
+        f"action=getmsg&__biz={biz}&f=json&offset={offset}"
+        f"&count={count}&is_ok=1&scene=124"
+        f"&uin=777&key=777"
+    )
+
+    result = {"articles": [], "next_offset": offset + count, "can_continue": False}
+
+    try:
+        response = await page.request.get(url)
+        data = await response.json()
+
+        if data.get("ret") != 0 and data.get("errmsg", "") != "ok":
+            print(f"getmsg API 返回错误: ret={data.get('ret')}, errmsg={data.get('errmsg')}")
+            return result
+
+        msg_list = data.get("general_msg_list", "")
+        result["articles"] = _parse_article_list(msg_list)
+        result["next_offset"] = data.get("next_offset", offset + count)
+        result["can_continue"] = data.get("can_msg_continue", 0) == 1
+
+    except Exception as e:
+        print(f"getmsg 请求失败: {e}")
+
+    return result
+
+
 async def crawl_articles_via_profile(
     context: BrowserContext,
     biz: str,
+    article_url: str = None,
     max_count: int = None,
     start_date: str = None,
     end_date: str = None,
     progress_callback=None,
 ) -> list[dict]:
     """
-    通过 profile_ext 页面获取公众号文章列表。
+    通过 profile_ext getmsg API 获取公众号文章列表。
 
-    原理：打开公众号历史消息页，拦截 AJAX 分页请求（action=getmsg），
-    解析返回的 JSON 获取文章列表。通过模拟滚动触发加载更多。
+    流程：
+    1. 先访问一篇文章建立 session
+    2. 直接调用 getmsg API 分页获取文章
+    3. 不需要滚动页面，直接 API 调用更稳定
 
     Args:
-        context: Playwright 浏览器上下文（微信 UA）
-        biz: 公众号 __biz 标识
-        max_count: 最大获取数量，None 表示全部
-        start_date: 发布开始日期 "YYYY-MM-DD"
-        end_date: 发布结束日期 "YYYY-MM-DD"
+        context: 微信 UA 浏览器上下文
+        biz: 公众号 __biz
+        article_url: 用于建立 session 的文章 URL
+        max_count: 最大获取数量
+        start_date: 开始日期 "YYYY-MM-DD"
+        end_date: 结束日期 "YYYY-MM-DD"
         progress_callback: 进度回调 callback(current, total_hint)
     """
 
-    def _in_date_range(publish_time: str) -> bool:
-        if not publish_time:
+    def _in_date_range(pt: str) -> bool:
+        if not pt:
             return True
-        d = publish_time[:10]
+        d = pt[:10]
         if start_date and d < start_date:
             return False
         if end_date and d > end_date:
             return False
         return True
 
-    def _before_start_date(publish_time: str) -> bool:
-        if not start_date or not publish_time:
+    def _before_start(pt: str) -> bool:
+        if not start_date or not pt:
             return False
-        return publish_time[:10] < start_date
+        return pt[:10] < start_date
 
-    all_articles = []
-    can_continue = True
-
-    # 用来收集 AJAX 响应中的文章
-    ajax_articles = []
-    ajax_done = asyncio.Event()
-    ajax_can_continue = [True]
-
-    async def handle_response(response):
-        """拦截 profile_ext?action=getmsg 的响应"""
-        url = response.url
-        if "profile_ext" in url and "action=getmsg" in url:
-            try:
-                data = await response.json()
-                msg_list = data.get("general_msg_list", "")
-                parsed = _parse_article_list(msg_list)
-                ajax_articles.extend(parsed)
-
-                if data.get("can_msg_continue") != 1:
-                    ajax_can_continue[0] = False
-            except Exception:
-                ajax_can_continue[0] = False
-            finally:
-                ajax_done.set()
-
-    page = await context.new_page()
-    page.on("response", handle_response)
-
-    try:
-        # 打开 profile_ext 页面
+    # 建立 session
+    if article_url:
+        page = await _init_session(context, article_url)
+    else:
+        # 没有文章 URL 时，构造一个 profile_ext 首页访问
+        page = await context.new_page()
         profile_url = (
             f"https://mp.weixin.qq.com/mp/profile_ext?"
             f"action=home&__biz={biz}&scene=124#wechat_redirect"
         )
         await page.goto(profile_url, wait_until="domcontentloaded", timeout=20000)
-        await page.wait_for_timeout(3000)
+        await page.wait_for_timeout(2000)
+        await _save_cookies(context)
 
-        # 保存 Cookie 供后续使用
-        await _save_cookies(page.context)
+    all_articles = []
+    offset = 0
 
-        # 首次加载的文章可能在页面 HTML 中
-        initial_articles_str = await page.evaluate("""
-            () => {
-                const scripts = document.querySelectorAll('script');
-                for (const s of scripts) {
-                    const text = s.textContent;
-                    const match = text.match(/var\\s+msgList\\s*=\\s*['"](.+?)['"]\\s*;/);
-                    if (match) {
-                        return match[1].replace(/&quot;/g, '"').replace(/&amp;/g, '&');
-                    }
-                    // 另一种格式
-                    const match2 = text.match(/var\\s+msgList\\s*=\\s*(\\{.+?\\})\\s*;/s);
-                    if (match2) {
-                        return match2[1];
-                    }
-                }
-                return null;
-            }
-        """)
+    if progress_callback:
+        progress_callback(0, max_count or 0)
 
-        if initial_articles_str:
-            initial = _parse_article_list(initial_articles_str)
-            for a in initial:
-                if max_count and len(all_articles) >= max_count:
-                    break
-                if _before_start_date(a["publish_time"]):
-                    can_continue = False
-                    break
-                if _in_date_range(a["publish_time"]):
-                    insert_article(biz=biz, **{k: a[k] for k in
-                        ["title", "url", "author", "digest", "cover_url", "publish_time"]})
-                    all_articles.append(a)
-
-        if progress_callback:
-            progress_callback(len(all_articles), max_count or 0)
-
-        # 滚动加载更多
-        scroll_count = 0
-        max_empty_scrolls = 3
-        empty_scrolls = 0
-
-        while can_continue:
+    try:
+        while True:
             if max_count and len(all_articles) >= max_count:
                 break
-            if not ajax_can_continue[0]:
+
+            page_data = await _fetch_getmsg(page, biz, offset=offset)
+
+            if not page_data["articles"]:
+                # 如果第一页就没数据，可能是 session 问题，打印调试信息
+                if offset == 0:
+                    print(f"[警告] 首页无数据，可能 session 未建立或 biz 无效: {biz}")
                 break
 
-            # 清空状态，准备接收下一批
-            ajax_articles.clear()
-            ajax_done.clear()
-
-            # 滚动到底部触发加载
-            await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-            scroll_count += 1
-
-            # 等待 AJAX 响应
-            try:
-                await asyncio.wait_for(ajax_done.wait(), timeout=10)
-            except asyncio.TimeoutError:
-                empty_scrolls += 1
-                if empty_scrolls >= max_empty_scrolls:
-                    break
-                continue
-
-            empty_scrolls = 0
-
-            if not ajax_articles:
-                break
-
-            # 处理这一批文章
             stop = False
-            for a in ajax_articles:
+            for a in page_data["articles"]:
                 if max_count and len(all_articles) >= max_count:
                     break
-                if _before_start_date(a["publish_time"]):
+                if _before_start(a["publish_time"]):
                     stop = True
                     break
                 if _in_date_range(a["publish_time"]):
@@ -339,11 +298,13 @@ async def crawl_articles_via_profile(
                         ["title", "url", "author", "digest", "cover_url", "publish_time"]})
                     all_articles.append(a)
 
-            if stop:
-                break
-
             if progress_callback:
                 progress_callback(len(all_articles), max_count or 0)
+
+            if stop or not page_data["can_continue"]:
+                break
+
+            offset = page_data["next_offset"]
 
             # 随机延时
             delay = random.uniform(CRAWL_DELAY_MIN, CRAWL_DELAY_MAX)
