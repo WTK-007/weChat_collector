@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.DS_Store
+.cookies.json
+data.db
+output/
+.claude/
